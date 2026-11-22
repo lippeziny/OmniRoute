@@ -1369,7 +1369,10 @@ export async function syncAllProviderLimits(
   caches: Record<string, ProviderLimitsCacheEntry>;
   errors: Record<string, string>;
 }> {
-  const configuredConcurrency = Number.parseInt(process.env.PROVIDER_LIMITS_SYNC_CONCURRENCY ?? "", 10);
+  const configuredConcurrency = Number.parseInt(
+    process.env.PROVIDER_LIMITS_SYNC_CONCURRENCY ?? "",
+    10
+  );
   const defaultConcurrency =
     Number.isInteger(configuredConcurrency) && configuredConcurrency > 0
       ? Math.min(configuredConcurrency, 20)
