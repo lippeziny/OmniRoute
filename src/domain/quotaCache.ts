@@ -16,6 +16,7 @@
  * @module domain/quotaCache
  */
 
+import { isLowResourceMode } from "@/lib/env/backgroundServices";
 import {
   captureCodexConnectionFence,
   runWithCodexConnectionFence,
@@ -104,7 +105,7 @@ export interface QuotaWindowObservation {
 
 const EXHAUSTED_TTL_MS = 5 * 60 * 1000; // 5 minutes for 429-sourced entries (no resetAt)
 const EXHAUSTED_REFRESH_MS = 5 * 60 * 1000; // 5 minutes: recheck exhausted accounts (aligned with TTL)
-const REFRESH_INTERVAL_MS = 60 * 1000; // Background tick every 1 minute
+const REFRESH_INTERVAL_MS = isLowResourceMode() ? 5 * 60 * 1000 : 60 * 1000; // 5m on small instances
 export const DEFAULT_QUOTA_THRESHOLD_PERCENT = 99;
 
 // ─── State ──────────────────────────────────────────────────────────────────
@@ -113,7 +114,7 @@ export const DEFAULT_QUOTA_THRESHOLD_PERCENT = 99;
 // dependency-free leaf `./quotaCacheState` so `open-sse/services/quotaPreflight.ts`
 // can read the override without importing this module (see the import note there).
 
-const MAX_CONCURRENT_REFRESHES = 5;
+const MAX_CONCURRENT_REFRESHES = isLowResourceMode() ? 1 : 5;
 
 // ─── #14359 park window + healthy override ──────────────────────────────────
 
