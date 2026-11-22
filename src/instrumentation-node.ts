@@ -550,6 +550,11 @@ export async function registerNodejs(): Promise<void> {
   // Rename the process title so OmniRoute is identifiable in ps/htop instead
   // of the generic "next-server" standalone server name.
   process.title = renameProcessTitle(process.title);
+  // Restore the last verified SQLite snapshot before any startup subsystem can
+  // initialize the database or create a new empty storage.sqlite.
+  await import("@/lib/db/r2Backup").then(({ restoreR2BackupBeforeDatabaseInit }) =>
+    restoreR2BackupBeforeDatabaseInit()
+  );
 
   // Record event-loop stalls (silent multi-minute freezes otherwise leave no
   // trace): a 1s monotonic timer logs one line at resume past the threshold
@@ -614,6 +619,11 @@ export async function registerNodejs(): Promise<void> {
   await ensureDbReadyForBoot();
 
   await ensureSecrets();
+  // R2 backups are independent of the local dashboard backup toggle. The
+  // scheduler takes an immediate SQLite snapshot and then repeats periodically.
+  await import("@/lib/db/r2Backup").then(({ startR2BackupScheduler }) =>
+    startR2BackupScheduler()
+  );
   await Promise.all([
     import("@/lib/env/runtimeEnv").then(({ enforceWebRuntimeEnv }) => enforceWebRuntimeEnv()),
     // Warn loudly at boot if STORAGE_ENCRYPTION_KEY is missing in production.
