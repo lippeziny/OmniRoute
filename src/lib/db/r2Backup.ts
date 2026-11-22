@@ -17,12 +17,16 @@ type R2Config = {
   prefix: string;
 };
 
-type BackupManifest = {
-  schema: "omniroute-r2-backup-v1";
+type BackupSnapshot = {
   slot: number;
   sha256: string;
   size: number;
   updatedAt: string;
+};
+
+type BackupManifest = {
+  schema: "omniroute-r2-backup-v1";
+  snapshots: BackupSnapshot[];
 };
 
 function envValue(name: string): string | undefined {
@@ -190,16 +194,31 @@ async function readManifest(config: R2Config): Promise<BackupManifest | null> {
   const value = parsed as Partial<BackupManifest>;
   if (
     value.schema !== "omniroute-r2-backup-v1" ||
-    !Number.isInteger(value.slot) ||
-    (value.slot as number) < 0 ||
-    (value.slot as number) >= SLOT_COUNT ||
-    typeof value.sha256 !== "string" ||
-    !/^[a-f0-9]{64}$/.test(value.sha256) ||
-    !Number.isSafeInteger(value.size) ||
-    (value.size as number) <= SQLITE_HEADER.length ||
-    typeof value.updatedAt !== "string"
+    !Array.isArray(value.snapshots) ||
+    value.snapshots.length < 1 ||
+    value.snapshots.length > SLOT_COUNT
   ) {
     throw new Error("[R2] Backup manifest failed validation.");
+  }
+
+  const seenSlots = new Set<number>();
+  for (const snapshot of value.snapshots) {
+    if (
+      !snapshot ||
+      !Number.isInteger(snapshot.slot) ||
+      snapshot.slot < 0 ||
+      snapshot.slot >= SLOT_COUNT ||
+      seenSlots.has(snapshot.slot) ||
+      typeof snapshot.sha256 !== "string" ||
+      !/^[a-f0-9]{64}$/.test(snapshot.sha256) ||
+      !Number.isSafeInteger(snapshot.size) ||
+      snapshot.size <= SQLITE_HEADER.length ||
+      typeof snapshot.updatedAt !== "string" ||
+      !Number.isFinite(Date.parse(snapshot.updatedAt))
+    ) {
+      throw new Error("[R2] Backup manifest failed validation.");
+    }
+    seenSlots.add(snapshot.slot);
   }
   return value as BackupManifest;
 }
@@ -222,7 +241,7 @@ export async function uploadSqliteBackupToR2(backupFile: string): Promise<boolea
   }
 
   const current = await readManifest(config);
-  const slot = current ? (current.slot + 1) % SLOT_COUNT : 0;
+  const slot = current ? (current.snapshots[0].slot + 1) % SLOT_COUNT : 0;
   const checksum = sha256(snapshot);
   const objectResponse = await signedRequest(config, "PUT", slotKey(config, slot), snapshot);
   if (!objectResponse.ok) {
@@ -230,12 +249,18 @@ export async function uploadSqliteBackupToR2(backupFile: string): Promise<boolea
     throw new Error(`[R2] SQLite upload failed (HTTP ${objectResponse.status}): ${detail}`);
   }
 
-  const manifest: BackupManifest = {
-    schema: "omniroute-r2-backup-v1",
+  const latest: BackupSnapshot = {
     slot,
     sha256: checksum,
     size: snapshot.length,
     updatedAt: new Date().toISOString(),
+  };
+  const manifest: BackupManifest = {
+    schema: "omniroute-r2-backup-v1",
+    snapshots: [latest, ...(current?.snapshots ?? []).filter((entry) => entry.slot !== slot)].slice(
+      0,
+      SLOT_COUNT
+    ),
   };
   const manifestResponse = await signedRequest(
     config,
@@ -275,43 +300,74 @@ export async function restoreR2BackupBeforeDatabaseInit(): Promise<boolean> {
     return false;
   }
 
-  const response = await signedRequest(config, "GET", slotKey(config, manifest.slot));
-  if (!response.ok) {
-    const detail = (await response.text()).slice(0, 300);
-    throw new Error(`[R2] Could not download SQLite snapshot (HTTP ${response.status}): ${detail}`);
-  }
-
-  const snapshot = Buffer.from(await response.arrayBuffer());
-  if (
-    snapshot.length !== manifest.size ||
-    sha256(snapshot) !== manifest.sha256 ||
-    snapshot.length <= SQLITE_HEADER.length ||
-    !snapshot.subarray(0, SQLITE_HEADER.length).equals(SQLITE_HEADER)
-  ) {
-    throw new Error("[R2] Downloaded SQLite snapshot failed size, checksum, or file-header validation.");
-  }
-
   await fs.promises.mkdir(dataDir, { recursive: true });
-  const temporaryFile = path.join(
-    dataDir,
-    `.storage.sqlite.r2-restore-${process.pid}-${Date.now()}.tmp`
-  );
-  try {
-    await fs.promises.writeFile(temporaryFile, snapshot, { flag: "wx", mode: 0o600 });
+  const failures: string[] = [];
+
+  for (const candidate of manifest.snapshots) {
+    let temporaryFile: string | null = null;
     try {
-      // link() is exclusive: a concurrent local DB creation wins and is never overwritten.
-      await fs.promises.link(temporaryFile, databaseFile);
+      const response = await signedRequest(config, "GET", slotKey(config, candidate.slot));
+      if (!response.ok) {
+        throw new Error(`download returned HTTP ${response.status}`);
+      }
+
+      const snapshot = Buffer.from(await response.arrayBuffer());
+      if (
+        snapshot.length !== candidate.size ||
+        sha256(snapshot) !== candidate.sha256 ||
+        snapshot.length <= SQLITE_HEADER.length ||
+        !snapshot.subarray(0, SQLITE_HEADER.length).equals(SQLITE_HEADER)
+      ) {
+        throw new Error("download failed size, checksum, or SQLite header validation");
+      }
+
+      temporaryFile = path.join(
+        dataDir,
+        `.storage.sqlite.r2-restore-${process.pid}-${Date.now()}.tmp`
+      );
+      await fs.promises.writeFile(temporaryFile, snapshot, { flag: "wx", mode: 0o600 });
+
+      // Verify SQLite's own integrity check before making the restored file live.
+      const { tryOpenSync } = await import("./adapters/driverFactory");
+      const validationDb = tryOpenSync(temporaryFile, { readonly: true, fileMustExist: true });
+      if (!validationDb) throw new Error("SQLite could not open the downloaded snapshot");
+      try {
+        const integrity = validationDb.pragma("integrity_check") as Array<{
+          integrity_check?: string;
+        }>;
+        if (integrity[0]?.integrity_check !== "ok") {
+          throw new Error("SQLite integrity_check did not return ok");
+        }
+      } finally {
+        validationDb.close();
+      }
+
+      try {
+        // link() is exclusive: a concurrent local DB creation wins and is never overwritten.
+        await fs.promises.link(temporaryFile, databaseFile);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+        throw error;
+      }
+
+      console.log(
+        `[R2] Restored SQLite database (${snapshot.length} bytes, updated ${candidate.updatedAt}).`
+      );
+      return true;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
-      throw error;
+      const detail = error instanceof Error ? error.message : String(error);
+      failures.push(`slot ${candidate.slot}: ${detail}`);
+      console.warn(`[R2] Snapshot slot ${candidate.slot} could not be restored:`, detail);
+    } finally {
+      if (temporaryFile) {
+        await fs.promises.rm(temporaryFile, { force: true }).catch(() => undefined);
+      }
     }
-    console.log(
-      `[R2] Restored SQLite database (${snapshot.length} bytes, updated ${manifest.updatedAt}).`
-    );
-    return true;
-  } finally {
-    await fs.promises.rm(temporaryFile, { force: true }).catch(() => undefined);
   }
+
+  throw new Error(
+    `[R2] No valid SQLite recovery snapshot could be restored: ${failures.join("; ")}`
+  );
 }
 
 let schedulerStarted = false;
