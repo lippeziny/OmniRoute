@@ -7,7 +7,7 @@
  */
 
 import { markServerReady, markServerStarting } from "@/lib/serverLifecycle";
-import { isBackgroundServicesDisabled } from "@/lib/env/backgroundServices";
+import { isBackgroundServicesDisabled, isLowResourceMode } from "@/lib/env/backgroundServices";
 import { normalizeBootError } from "@/lib/instrumentationBootError";
 import { isHeadless, skipInHeadless } from "@/lib/system/headless";
 
@@ -538,6 +538,14 @@ export async function startOptionalBootSubsystems(
     );
     return [];
   }
+  if (isLowResourceMode(env)) {
+    log(
+      `[STARTUP] Low-resource mode: skipping optional subsystems: ${subsystems
+        .map((subsystem) => subsystem.name)
+        .join(", ")}`
+    );
+    return [];
+  }
   const results = await Promise.allSettled(subsystems.map((subsystem) => subsystem.start()));
   return subsystems
     .filter((_, index) => results[index].status === "fulfilled")
@@ -546,6 +554,10 @@ export async function startOptionalBootSubsystems(
 
 export async function registerNodejs(): Promise<void> {
   markServerStarting();
+  const lowResourceMode = isLowResourceMode();
+  if (lowResourceMode) {
+    console.log("[STARTUP] Low-resource mode enabled: dashboard and core API remain enabled");
+  }
 
   // Rename the process title so OmniRoute is identifiable in ps/htop instead
   // of the generic "next-server" standalone server name.
@@ -661,13 +673,17 @@ export async function registerNodejs(): Promise<void> {
     console.warn("[STARTUP] Could not clear stale crash cooldowns (non-fatal):", msg);
   }
 
-  await scanComboModelNameCollisionsAtBoot();
-  try {
-    const { warnProviderPrefixCollisionsAtBoot } =
-      await import("@/lib/providers/providerPrefixCollision");
-    await warnProviderPrefixCollisionsAtBoot();
-  } catch {
-    console.warn("[STARTUP] Could not scan provider-prefix collisions (non-fatal).");
+  if (!lowResourceMode) {
+    await scanComboModelNameCollisionsAtBoot();
+    try {
+      const { warnProviderPrefixCollisionsAtBoot } =
+        await import("@/lib/providers/providerPrefixCollision");
+      await warnProviderPrefixCollisionsAtBoot();
+    } catch {
+      console.warn("[STARTUP] Could not scan provider-prefix collisions (non-fatal).");
+    }
+  } else {
+    console.log("[STARTUP] Low-resource mode: startup-only diagnostic scans skipped");
   }
   await warmAdaptiveVirtualLanesIntoRuntime();
 
@@ -675,7 +691,6 @@ export async function registerNodejs(): Promise<void> {
     { initGracefulShutdown },
     { initApiBridgeServer },
     { startBackgroundRefresh },
-    { ensureCloudSyncInitialized },
     { startProviderLimitsSyncScheduler },
     { getSettings },
     { applyRuntimeSettings },
@@ -684,13 +699,10 @@ export async function registerNodejs(): Promise<void> {
     { startCleanupScheduler },
     { registerDefaultGuardrails },
     { ensurePersistentManagementPasswordHash },
-    { skillExecutor },
-    { registerBuiltinSkills },
   ] = await Promise.all([
     import("@/lib/gracefulShutdown"),
     import("@/lib/apiBridgeServer"),
     import("@/domain/quotaCache"),
-    import("@/lib/initCloudSync"),
     import("@/shared/services/providerLimitsSyncScheduler"),
     import("@/lib/db/settings"),
     import("@/lib/config/runtimeSettings"),
@@ -699,16 +711,16 @@ export async function registerNodejs(): Promise<void> {
     import("@/lib/db/cleanup"),
     import("@/lib/guardrails"),
     import("@/lib/auth/managementPassword"),
-    import("@/lib/skills/executor"),
-    import("@/lib/skills/builtins"),
   ]);
 
-  // Proxy health scheduler (auto-removes dead proxies on interval)
-  await import("@/lib/proxyHealth/scheduler");
+  // Proxy health scans are auxiliary background work on constrained instances.
+  if (!lowResourceMode) {
+    await import("@/lib/proxyHealth/scheduler");
+  }
 
   // Free-proxy auto-sync scheduler (re-fetches free-proxy sources on interval, #7079).
   // Optional: skipped in headless mode (src/lib/system/headless.ts).
-  if (!skipInHeadless("free-proxy-sync")) {
+  if (!lowResourceMode && !skipInHeadless("free-proxy-sync")) {
     await import("@/lib/freeProxyProviders/scheduler");
   }
 
@@ -716,7 +728,15 @@ export async function registerNodejs(): Promise<void> {
   initApiBridgeServer();
   startSpendBatchWriter();
   registerDefaultGuardrails();
-  registerBuiltinSkills(skillExecutor);
+  if (!lowResourceMode) {
+    const [{ skillExecutor }, { registerBuiltinSkills }] = await Promise.all([
+      import("@/lib/skills/executor"),
+      import("@/lib/skills/builtins"),
+    ]);
+    registerBuiltinSkills(skillExecutor);
+  } else {
+    console.log("[STARTUP] Low-resource mode: optional builtin skill runtime skipped");
+  }
   console.log("[STARTUP] Spend batch writer started");
   console.log("[STARTUP] Guardrail registry initialized");
   console.log("[STARTUP] Builtin skill handlers registered");
@@ -733,28 +753,35 @@ export async function registerNodejs(): Promise<void> {
     const { startQuotaSessionRecovery } = await import("@/lib/quota/quotaSessionRecovery");
     startQuotaSessionRecovery();
     console.log("[STARTUP] Quota session recovery scheduler started (opt-in)");
-    const { startQuotaAutoPing } = await import("@/lib/services/quotaAutoPing");
-    startQuotaAutoPing();
-    console.log("[STARTUP] Quota auto-ping scheduler started (opt-in, no-op until enabled)");
-    const { startBankedResetAutoApply } = await import("@/lib/services/bankedResetAutoApply");
-    startBankedResetAutoApply();
-    console.log(
-      "[STARTUP] Banked-reset auto-apply scheduler started (opt-in, no-op until enabled)"
-    );
-    const { startCodexWakeups } = await import("@/lib/services/codexWakeups");
-    startCodexWakeups();
-    console.log("[STARTUP] Codex wakeup scheduler started (no-op until a task is created)");
-    const { startCodexResetCreditAutospend } =
-      await import("@/lib/services/codexResetCreditAutospend");
-    startCodexResetCreditAutospend();
-    console.log(
-      "[STARTUP] Codex reset-credit auto-spend scheduler started (opt-in, no-op until enabled)"
-    );
-    // Optional: cloud/model sync is skipped in headless mode (src/lib/system/headless.ts).
-    if (!skipInHeadless("cloud-sync")) {
-      const cloudSyncInitialized = await ensureCloudSyncInitialized();
+
+    if (!lowResourceMode) {
+      const { startQuotaAutoPing } = await import("@/lib/services/quotaAutoPing");
+      startQuotaAutoPing();
+      console.log("[STARTUP] Quota auto-ping scheduler started (opt-in, no-op until enabled)");
+      const { startBankedResetAutoApply } = await import("@/lib/services/bankedResetAutoApply");
+      startBankedResetAutoApply();
       console.log(
-        `[STARTUP] Cloud/model sync background bootstrap ${cloudSyncInitialized ? "initialized" : "skipped"}`
+        "[STARTUP] Banked-reset auto-apply scheduler started (opt-in, no-op until enabled)"
+      );
+      const { startCodexWakeups } = await import("@/lib/services/codexWakeups");
+      startCodexWakeups();
+      console.log("[STARTUP] Codex wakeup scheduler started (no-op until a task is created)");
+      const { startCodexResetCreditAutospend } =
+        await import("@/lib/services/codexResetCreditAutospend");
+      startCodexResetCreditAutospend();
+      console.log(
+        "[STARTUP] Codex reset-credit auto-spend scheduler started (opt-in, no-op until enabled)"
+      );
+      if (!skipInHeadless("cloud-sync")) {
+        const { ensureCloudSyncInitialized } = await import("@/lib/initCloudSync");
+        const cloudSyncInitialized = await ensureCloudSyncInitialized();
+        console.log(
+          `[STARTUP] Cloud/model sync background bootstrap ${cloudSyncInitialized ? "initialized" : "skipped"}`
+        );
+      }
+    } else {
+      console.log(
+        "[STARTUP] Low-resource mode: quota refresh, provider-limit sync and session recovery stay enabled; auxiliary sync jobs skipped"
       );
     }
     await startBatchProcessor();
@@ -907,13 +934,17 @@ export async function registerNodejs(): Promise<void> {
   if (!isBackgroundServicesDisabled()) {
     // Storage-configured scheduled VACUUM (#4437): registers the timer from
     // Settings > System & Storage and persists lastVacuumAt for the UI.
-    try {
-      const { initVacuumScheduler } = await import("@/lib/db/vacuumScheduler");
-      initVacuumScheduler();
-      console.log("[STARTUP] Scheduled VACUUM initialized (#4437)");
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn("[STARTUP] Could not initialize vacuum scheduler (non-fatal):", msg);
+    if (!lowResourceMode) {
+      try {
+        const { initVacuumScheduler } = await import("@/lib/db/vacuumScheduler");
+        initVacuumScheduler();
+        console.log("[STARTUP] Scheduled VACUUM initialized (#4437)");
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn("[STARTUP] Could not initialize vacuum scheduler (non-fatal):", msg);
+      }
+    } else {
+      console.log("[STARTUP] Low-resource mode: scheduled VACUUM skipped");
     }
 
     // Retention cleanup scheduler (#4691/#6988, #9624): runs the general retention
@@ -930,77 +961,65 @@ export async function registerNodejs(): Promise<void> {
     console.log("[STARTUP] Background schedulers disabled (vacuum, cleanup)");
   }
 
-  if (!isBackgroundServicesDisabled()) {
-    // Warm the model catalog's durable, apiKey-independent sub-caches at
-    // startup — see warmModelCatalogCache() for why the top-level Response
-    // cache alone doesn't deliver this. Fire-and-forget, non-fatal.
-    void warmModelCatalogCache();
 
-    // All services are independent — run in parallel for faster cold start.
-    await Promise.allSettled([
+  if (!isBackgroundServicesDisabled()) {
+    if (!lowResourceMode) {
+      void warmModelCatalogCache();
+    } else {
+      console.log("[STARTUP] Low-resource mode: deferred model-catalog warmup until first request");
+    }
+
+    // Keep the background services that protect core routing and account recovery.
+    const backgroundTasks: Promise<unknown>[] = [
       import("@omniroute/open-sse/services/autoRefreshDaemon")
         .then((m) => m.autoRefreshDaemon.start())
         .catch((err: unknown) => {
           const msg = err instanceof Error ? err.message : String(err);
           console.warn("[STARTUP] Auto-refresh daemon failed to start (non-fatal):", msg);
         }),
-
-      // Proactive connection-cooldown recovery (#8): re-validate connections whose
-      // transient `rate_limited_until` window has elapsed OUTSIDE the request hot path,
-      // so the first request after a cooldown does not pay the probe latency.
       import("@/lib/quota/connectionRecovery")
         .then((m) => m.initConnectionRecoveryScheduler())
         .catch((err: unknown) => {
           const msg = err instanceof Error ? err.message : String(err);
           console.warn("[STARTUP] Connection recovery scheduler failed to start (non-fatal):", msg);
         }),
-
-      // Context-window self-correction (5004): periodically reconcile provider-declared
-      // windows (from /models discovery) into auto:discovery overrides. Never fatal.
       import("@/lib/contextWindowResolver")
         .then((m) => m.startContextWindowReconcile())
         .catch((err: unknown) => {
           const msg = err instanceof Error ? err.message : String(err);
           console.warn("[STARTUP] context-window reconcile failed to start (non-fatal):", msg);
         }),
+    ];
 
-      // TV6 typed memory decay: optional periodic sweep of decayed episodic memories.
-      // Doubly opt-in (no-op unless MEMORY_TYPED_DECAY_ENABLED=true AND
-      // MEMORY_TYPED_DECAY_SWEEP_INTERVAL>0). Never deletes by default. Never fatal.
-      import("@/lib/memory/typedDecay")
-        .then((m) => m.startMemoryDecaySweep())
-        .catch((err: unknown) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.warn("[STARTUP] memory decay sweep failed to start (non-fatal):", msg);
-        }),
+    if (!lowResourceMode) {
+      backgroundTasks.push(
+        import("@/lib/memory/typedDecay")
+          .then((m) => m.startMemoryDecaySweep())
+          .catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.warn("[STARTUP] memory decay sweep failed to start (non-fatal):", msg);
+          }),
+        import("@/lib/memory/index")
+          .then((m) => m.initMemoryBackends())
+          .catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.warn("[STARTUP] memory backend initialization failed (non-fatal):", msg);
+          }),
+        import("@/lib/jobs/backupScheduleJob")
+          .then((m) => m.startBackupScheduleJob())
+          .catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.warn("[STARTUP] backup schedule job failed to start (non-fatal):", msg);
+          }),
+        startOptionalBootSubsystems()
+      );
+    } else {
+      console.log(
+        "[STARTUP] Low-resource mode: memory backends, scheduled file backups and auxiliary services skipped"
+      );
+    }
 
-      // MemoryBackend provider pattern (PR #8752): initialize configured memory
-      // backends from settings (sqlite, obsidian, notion, custom HTTP, etc.).
-      // Reads the DB settings synchronously (non-blocking, never fatal). Must
-      // run after the DB is ready AND after getSettings/applyRuntimeSettings so
-      // memory backend config is hydrated.
-      import("@/lib/memory/index")
-        .then((m) => m.initMemoryBackends())
-        .catch((err: unknown) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.warn("[STARTUP] memory backend initialization failed (non-fatal):", msg);
-        }),
-
-      // Backup schedule (#8513): execute `backup-schedule.json` cron server-side.
-      // Reads the schedule written by `omniroute backup auto enable` and fires
-      // `runBackupCommand` when the cron expression matches. Self-gated: no-op
-      // when no schedule file exists or the schedule is disabled. Never fatal.
-      import("@/lib/jobs/backupScheduleJob")
-        .then((m) => m.startBackupScheduleJob())
-        .catch((err: unknown) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.warn("[STARTUP] backup schedule job failed to start (non-fatal):", msg);
-        }),
-
-      // Optional subsystems (dashboard, catalog enrichment, embedded
-      // services…): skipped entirely in headless mode — see OPTIONAL_BOOT_SUBSYSTEMS.
-      startOptionalBootSubsystems(),
-    ]);
+    await Promise.allSettled(backgroundTasks);
   }
 
   markServerReady();
