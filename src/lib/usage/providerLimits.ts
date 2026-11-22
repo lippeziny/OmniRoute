@@ -1,3 +1,4 @@
+import { isLowResourceMode } from "@/lib/env/backgroundServices";
 import { syncCodexQuotaObservation } from "@/lib/db/providers/codexAccountRecovery";
 import { syncCodexWorkspaceInfoIfNeeded } from "@/lib/usage/codexWorkspaceSync";
 import { syncCodexPlanFromUsage } from "@/lib/usage/codexPlanSync";
@@ -1368,7 +1369,14 @@ export async function syncAllProviderLimits(
   caches: Record<string, ProviderLimitsCacheEntry>;
   errors: Record<string, string>;
 }> {
-  const { source = "manual", concurrency = 5 } = options;
+  const configuredConcurrency = Number.parseInt(process.env.PROVIDER_LIMITS_SYNC_CONCURRENCY ?? "", 10);
+  const defaultConcurrency =
+    Number.isInteger(configuredConcurrency) && configuredConcurrency > 0
+      ? Math.min(configuredConcurrency, 20)
+      : isLowResourceMode()
+        ? 1
+        : 5;
+  const { source = "manual", concurrency = defaultConcurrency } = options;
   const connectionRows = (await getProviderConnections({
     isActive: true,
   })) as unknown as ProviderConnectionLike[];
