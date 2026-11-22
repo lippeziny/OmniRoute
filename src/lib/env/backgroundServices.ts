@@ -9,3 +9,16 @@ export function isBackgroundServicesDisabled(env: NodeJS.ProcessEnv = process.en
   if (!raw) return false;
   return TRUTHY_ENV_VALUES.has(raw.trim().toLowerCase());
 }
+
+
+/**
+ * Resource-constrained deployment mode. Unlike headless mode, this keeps the
+ * dashboard and every HTTP/API route enabled; it only reduces optional work.
+ */
+export function isLowResourceMode(
+  env: Readonly<Record<string, string | undefined>> = process.env
+): boolean {
+  const raw = env.OMNIROUTE_LOW_RESOURCE_MODE;
+  if (!raw) return false;
+  return TRUTHY_ENV_VALUES.has(raw.trim().toLowerCase());
+}
