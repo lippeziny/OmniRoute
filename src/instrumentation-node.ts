@@ -739,7 +739,9 @@ export async function registerNodejs(): Promise<void> {
   }
   console.log("[STARTUP] Spend batch writer started");
   console.log("[STARTUP] Guardrail registry initialized");
-  console.log("[STARTUP] Builtin skill handlers registered");
+  if (!lowResourceMode) {
+    console.log("[STARTUP] Builtin skill handlers registered");
+  }
   // Request-path gate (not a background service): with "auto-apply banked resets" off it
   // defers to the per-account autoLimitReset toggle, so behavior is unchanged.
   const { registerClaudeSessionResetPolicy } = await import("@/lib/usage/claudeSessionResetPolicy");
@@ -869,7 +871,7 @@ export async function registerNodejs(): Promise<void> {
       console.log(
         `[STARTUP] Migrated Codex connection defaults for ${migration.updatedConnectionIds.length} connection(s)`
       );
-      if (settings.cloudEnabled === true) {
+      if (settings.cloudEnabled === true && !lowResourceMode) {
         const [{ syncToCloud }, { getConsistentMachineId }] = await Promise.all([
           import("@/lib/cloudSync"),
           import("@/shared/utils/machineId"),
