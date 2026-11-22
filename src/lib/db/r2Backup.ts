@@ -333,11 +333,19 @@ export function startR2BackupScheduler(): boolean {
     if (backupInFlight) return;
     backupInFlight = true;
     try {
-      const { backupDbFileAwaited } = await import("./backup");
+      const [{ backupDbFileAwaited }, { DB_BACKUPS_DIR }] = await Promise.all([
+        import("./backup"),
+        import("./core"),
+      ]);
       const result = await backupDbFileAwaited("r2-auto", { mandatory: true });
       if (!result) {
         console.warn("[R2] Scheduled backup skipped because the local SQLite database is not ready.");
+        return;
       }
+      if (!DB_BACKUPS_DIR) {
+        throw new Error("[R2] Local SQLite backup directory is unavailable in this runtime.");
+      }
+      await uploadSqliteBackupToR2(path.join(DB_BACKUPS_DIR, result.filename));
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       console.warn("[R2] Scheduled backup failed; it will be retried at the next interval:", detail);
